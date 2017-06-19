@@ -1,7 +1,7 @@
 apply plugin: 'com.android.application'
 
 android {
-    compileSdkVersion 25
+    compileSdkVersion 26
     buildToolsVersion "26.0.0"
     defaultConfig {
         applicationId "net.felipeal.that"
@@ -30,4 +30,5 @@ dependencies {
     compileOnly 'com.google.android.things:androidthings:+'
     compile 'com.google.android.things.contrib:driver-button:+'
     compile 'com.google.android.things.contrib:driver-rainbowhat:0.4'
+    compile 'com.neovisionaries:nv-bluetooth:1.8'
 }

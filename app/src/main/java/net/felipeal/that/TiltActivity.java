@@ -16,6 +16,13 @@
 package net.felipeal.that;
 
 import android.app.Activity;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothManager;
+import android.bluetooth.le.BluetoothLeScanner;
+import android.bluetooth.le.ScanCallback;
+import android.bluetooth.le.ScanResult;
+import android.content.Context;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Message;
@@ -26,11 +33,15 @@ import com.google.android.things.contrib.driver.ht16k33.AlphanumericDisplay;
 import com.google.android.things.contrib.driver.ht16k33.Ht16k33;
 import com.google.android.things.contrib.driver.rainbowhat.RainbowHat;
 import com.google.android.things.pio.Gpio;
+import com.neovisionaries.bluetooth.ble.advertising.ADPayloadParser;
+import com.neovisionaries.bluetooth.ble.advertising.ADStructure;
+import com.neovisionaries.bluetooth.ble.advertising.IBeacon;
 
 import java.io.FileDescriptor;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.util.Arrays;
+import java.util.List;
 
 /**
  * Uses the Rainbow HAT to monitor the progress of a
@@ -51,6 +62,15 @@ import java.util.Arrays;
  *
  * <p>Or to send commands (run {@code adb shell dumpsys activity net.felipeal.that -h} for help).
  *
+ * <p><b>NOTE:</b> if the BLE scanning fails due to lack of permission, please run:
+ * <pre>
+ *   adb shell pm grant net.felipeal.that android.permission.ACCESS_COARSE_LOCATION
+ * </pre>
+ * <p>or:
+ * <pre>
+ *   adb shell pm grant net.felipeal.that android.permission.ACCESS_FINE_LOCATION
+ * </pre>
+ *
  */
 public class TiltActivity extends Activity {
 
@@ -70,9 +90,12 @@ public class TiltActivity extends Activity {
     private static final int MSG_DISPLAY_TEMPERATURE = 5;
     private static final int MSG_DISPLAY_LAST_POLL = 6;
     private static final int MSG_DISPLAY_MESSAGE = 7;
+    private static final int MSG_SET_TILT_VALUES = 8;
 
     private static final int DISPLAY_UPDATE_FREQUENCY_MS = 1000;
     private static final int LED_ON_DURATION_MS = 200;
+    // TODO: make it 30s
+    private static final int DEFAULT_SCAN_FREQUENCY_MS = 10_000;
 
     private Button mButtonA;
     private Button mButtonB;
@@ -82,15 +105,16 @@ public class TiltActivity extends Activity {
     private Gpio mLedC;
     private AlphanumericDisplay mSegment;
 
-    // TODO: remove initial value
-    private float mGravity = 1.083F;
-
-    // TODO: remove initial value
-    private float mWortTempF = 65;
+    private int mGravity;
+    private int mWortTempF;
 
     private int mMode = MODE_GRAVITY;
     private String mTiltColor = "RED";
-    private long mLastPoll;
+    private long mLastScan;
+    private int mPollFrequencyMs = DEFAULT_SCAN_FREQUENCY_MS;
+
+    private BluetoothAdapter mBluetoothAdapter;
+    private BluetoothLeScanner mScanner;
 
     private Handler mHandler = new Handler() {
 
@@ -119,6 +143,9 @@ public class TiltActivity extends Activity {
                 case MSG_DISPLAY_MESSAGE:
                     displayMessage((String) msg.obj);
                     return;
+                case MSG_SET_TILT_VALUES:
+                    handleUpdateTilt(msg.arg1, msg.arg2);
+                    return;
                 default:
                     Log.w(TAG, "invalid message on handler: " + msg);
             }
@@ -146,7 +173,14 @@ public class TiltActivity extends Activity {
             mButtonB.setOnButtonEventListener(listener);
             mButtonC.setOnButtonEventListener(listener);
 
-            pollTilt();
+            final BluetoothManager bluetoothManager =
+                    (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
+            mBluetoothAdapter = bluetoothManager.getAdapter();
+
+            mScanner = mBluetoothAdapter.getBluetoothLeScanner();
+
+
+            scan();
             handleDisplayGravity();
 
             // TODO: use rainbow to track final gravity as it approaches expected FG
@@ -176,34 +210,45 @@ public class TiltActivity extends Activity {
             return;
         }
         pw.printf("Tilt color: %s\n", mTiltColor);
-        pw.printf("Gravity: %.3f\n", mGravity);
-        pw.printf("Temperature: %.2fF (%.2fC)\n", mWortTempF, toCelsius(mWortTempF));
+        if (mGravity > 0) {
+            pw.printf("Gravity: %.3f\n", (((float) mGravity)/1000));
+        } else {
+            pw.println("Gravity: N/A");
+        }
+        if (mWortTempF > 0) {
+            pw.printf("Temperature: %dF (%.2fC)\n", mWortTempF, toCelsius(mWortTempF));
+        } else {
+            pw.println("Temperature: N/A");
+        }
         pw.printf("Display mode: %s\n", modeAsString());
-        pw.printf("Last poll: %s\n", getLastPoll());
+        pw.printf("Scan frequency: %dms\n", mPollFrequencyMs);
+        pw.printf("Last scan: %s\n", getLastScan());
         pw.printf("Display update frequency: %dms\n", DISPLAY_UPDATE_FREQUENCY_MS);
         pw.printf("Led duration: %dms\n", LED_ON_DURATION_MS);
     }
 
     private void runCommand(PrintWriter pw, String[] args) {
         String cmd = args[0];
+        Log.d(TAG,"runCoomand: " + cmd);
         try {
             switch (cmd) {
                 case "-g":
-                    mGravity = Float.parseFloat(args[1]);
-                    mLastPoll = System.currentTimeMillis();
-                    pw.printf("Set gravity to %.3f\n", mGravity);
+                    float gravity = Float.parseFloat(args[1]);
+                    mLastScan = System.currentTimeMillis();
+                    pw.printf("Set gravity to %.3f\n", gravity);
+                    mGravity = (int) (gravity * 1000);
                     return;
-                case "-c":
-                    mWortTempF = Float.parseFloat(args[1]);
-                    mLastPoll = System.currentTimeMillis();
-                    pw.printf("Set temperature to %.3fC\n", mWortTempF);
+                case "-t":
+                    mWortTempF = Integer.parseInt(args[1]);
+                    mLastScan = System.currentTimeMillis();
+                    pw.printf("Set temperature to %dF\n", mWortTempF);
                     return;
                 case "-h":
                     pw.println("Usage:");
                     pw.println("  -g GRAVITY");
                     pw.println("     Sets the current gravity. Example: -g 1.050");
-                    pw.println("  -c TEMPERATURE");
-                    pw.println("     Sets the current temperature, in Fahrenheit. Example: -c 65");
+                    pw.println("  -t TEMPERATURE");
+                    pw.println("     Sets the current temperature, in Fahrenheit. Example: -t 65");
                     return;
             }
         } catch (Exception e) {
@@ -271,7 +316,11 @@ public class TiltActivity extends Activity {
         }
 
         // displayMessage("GRAV");
-        displayMessage(String.format("%.3f", mGravity));
+        if (mGravity > 0) {
+            displayMessage(String.format("%.3f", (((float) mGravity)/1000)));
+        } else {
+            displayMessage("N/A");
+        }
         mHandler.sendMessageDelayed(mHandler.obtainMessage(MSG_DISPLAY_GRAVITY),
                 DISPLAY_UPDATE_FREQUENCY_MS);
     }
@@ -288,20 +337,24 @@ public class TiltActivity extends Activity {
     }
 
     private void handleDisplayTemperature() {
-        String temp;
-        switch (mMode) {
-            case MODE_TEMP_F:
-                temp = String.format("%.1fC", mWortTempF);
-                break;
-            case MODE_TEMP_C:
-                temp = String.format("%.1fF", toCelsius(mWortTempF));
-                break;
-            default:
-                // Another button was pressed; ignore.
-                return;
+        if (mWortTempF > 0) {
+            String temp;
+            switch (mMode) {
+                case MODE_TEMP_F:
+                    temp = String.format("%dF", mWortTempF);
+                    break;
+                case MODE_TEMP_C:
+                    temp = String.format("%.1fC", toCelsius(mWortTempF));
+                    break;
+                default:
+                    // Another button was pressed; ignore.
+                    return;
+            }
+            // displayMessage("TEMP");
+            displayMessage(temp);
+        } else {
+            displayMessage("N/A");
         }
-        // displayMessage("TEMP");
-        displayMessage(temp);
         mHandler.sendMessageDelayed(mHandler.obtainMessage(MSG_DISPLAY_TEMPERATURE),
                 DISPLAY_UPDATE_FREQUENCY_MS);
     }
@@ -318,20 +371,65 @@ public class TiltActivity extends Activity {
             return;
         }
 
-        displayMessage(getLastPoll());
+        displayMessage(getLastScan());
         mHandler.sendMessageDelayed(mHandler.obtainMessage(MSG_DISPLAY_LAST_POLL),
                 DISPLAY_UPDATE_FREQUENCY_MS);
     }
 
-    private String getLastPoll() {
-        int delta = (int) ((System.currentTimeMillis() - mLastPoll) / 1000);
+    private String getLastScan() {
+        int delta = (int) ((System.currentTimeMillis() - mLastScan) / 1000);
         // TODO: different message if it's more than 999 seconds
         return String.format("%ds", delta);
     }
 
-    private void pollTilt() {
-        Log.d(TAG, "polling Tilt...");
-        mLastPoll = System.currentTimeMillis();
+    private void scan() {
+        Log.d(TAG, "Starting Tilt scan...");
+        mScanner.startScan(new ScanCallback() {
+            @Override
+            public void onScanResult(int callbackType, ScanResult result) {
+                BluetoothDevice device = result.getDevice();
+                String name = device.getName();
+                if ("Tilt".equals(name)) {
+                    byte[] scanRecord = result.getScanRecord().getBytes();
+                    List<ADStructure> structures =
+                            ADPayloadParser.getInstance().parse(scanRecord);
+                    for (ADStructure structure : structures) {
+                        // If the ADStructure instance can be cast to IBeacon.
+                        if (structure instanceof IBeacon) {
+                            // An iBeacon was found.
+                            IBeacon iBeacon = (IBeacon) structure;
+                            // (1) Proximity UUID
+                            //UUID uuid = iBeacon.getUUID();
+                            // (2) Major number
+                            int major = iBeacon.getMajor();
+                            // (3) Minor number
+                            int minor = iBeacon.getMinor();
+                            // (4) Tx Power
+                            //int power = iBeacon.getPower();
+                            Log.e(TAG, "Scan results: temp=" + major + " grav=" + minor);
+                            mHandler.sendMessage(
+                                    mHandler.obtainMessage(MSG_SET_TILT_VALUES, major, minor));
+                        }
+                    }
+                }
+            }
+
+            @Override
+            public void onScanFailed(int errorCode) {
+                Log.e(TAG, "FAILED: " + errorCode);
+            }
+
+            @Override
+            public void onBatchScanResults(List<android.bluetooth.le.ScanResult> results) {
+                Log.e(TAG, "BATCH: " + results);
+            }
+        });
+    }
+
+    private void handleUpdateTilt(int temp, int gravity) {
+        mLastScan = System.currentTimeMillis();
+        mGravity = gravity;
+        mWortTempF = temp;
     }
 
     private void turnOnLed(Gpio led) {
@@ -350,7 +448,7 @@ public class TiltActivity extends Activity {
         return (tempC * 1.8F) + 32;
     }
 
-    private float toCelsius(float tempF) {
+    private float toCelsius(int tempF) {
         return (tempF - 32) * 0.5556F;
     }
 
